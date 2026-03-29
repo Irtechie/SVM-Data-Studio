@@ -1,0 +1,5 @@
+domain,filename,source,common_name,rows,columns,target_column,notes
+cancer,cancer_uci.csv,UCI Machine Learning Repository,Wisconsin Diagnostic Breast Cancer,569,32,target_name,Binary classification dataset; exported via scikit-learn loader with UCI provenance.
+fraud,fraud_openml.csv,OpenML,Credit Card Fraud Detection,50000,30,Class,Repo-safe stratified sample from OpenML credit card fraud dataset id 1597.
+itemset,itemset_uci_onlineretail.csv,UCI Machine Learning Repository,Online Retail,12000,14,,Prepared invoice-level spreadsheet for itemset mining from the UCI Online Retail dataset (DOI 10.24432/C5BW33).
+episode,episode_uci_msnbc.csv,UCI Machine Learning Repository,MSNBC.com Anonymous Web Data,20000,9,,Prepared sequence spreadsheet for episode mining from the UCI MSNBC dataset (DOI 10.24432/C5390X).
