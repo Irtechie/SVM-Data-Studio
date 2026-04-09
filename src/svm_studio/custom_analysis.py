@@ -9,7 +9,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.svm import SVC
@@ -58,27 +58,31 @@ def prepare_custom_classification_data(
         raise ValueError("Choose at least one feature column.")
 
     working = frame[feature_columns + [target_column]].copy()
-    working = working.dropna(subset=[target_column])
+    working.columns = [str(c) for c in working.columns]  # plain str for sklearn 1.8+
+    working = working.dropna(subset=[str(target_column)])
     if working.empty:
         raise ValueError("No rows remain after removing missing target values.")
 
-    X = working[feature_columns].copy()
-    y = working[target_column].astype(str).copy()
+    str_features = [str(c) for c in feature_columns]
+    X = working[str_features].copy()
+    y = working[str(target_column)].astype(str).copy()
     _validate_target(y)
     return X, y
 
 
 def _split_feature_types(frame: pd.DataFrame) -> tuple[list[str], list[str]]:
     numeric_columns = [
-        column
+        str(column)
         for column in frame.columns
         if pd.api.types.is_numeric_dtype(frame[column]) and not pd.api.types.is_bool_dtype(frame[column])
     ]
-    categorical_columns = [column for column in frame.columns if column not in numeric_columns]
+    categorical_columns = [str(column) for column in frame.columns if str(column) not in numeric_columns]
     return numeric_columns, categorical_columns
 
 
 def _build_pipeline(feature_frame: pd.DataFrame) -> Pipeline:
+    # Ensure column names are plain str (sklearn 1.8+ is strict about types)
+    feature_frame = feature_frame.rename(columns={c: str(c) for c in feature_frame.columns})
     numeric_columns, categorical_columns = _split_feature_types(feature_frame)
     transformers: list[tuple[str, Pipeline, list[str]]] = []
 
@@ -110,7 +114,7 @@ def _build_pipeline(feature_frame: pd.DataFrame) -> Pipeline:
             )
         )
 
-    preprocessor = ColumnTransformer(transformers=transformers)
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
     return Pipeline(
         [
             ("preprocessor", preprocessor),
@@ -273,3 +277,87 @@ def run_custom_svm_analysis(
         y_test=y_test.reset_index(drop=True),
         y_pred=y_pred,
     )
+
+
+# ── LLM grading helpers ────────────────────────────────────────────────────
+
+
+@dataclass
+class EvaluationResult:
+    """Graded evaluation of a column set for SVM classification."""
+
+    target_column: str
+    feature_columns: list[str]
+    holdout_accuracy: float
+    holdout_macro_f1: float
+    cv_mean_accuracy: float
+    cv_std_accuracy: float
+    grade: float  # simple average of holdout_accuracy and cv_mean_accuracy
+    kernels_tested: list[str]
+    n_cv_folds: int
+
+
+def evaluate_column_set(
+    frame: pd.DataFrame,
+    target_column: str,
+    feature_columns: list[str],
+    kernels: list[str] | None = None,
+    n_cv_folds: int = 10,
+) -> EvaluationResult:
+    """Grade a column set with a 50/50 hold-out split and *n_cv_folds*-fold CV.
+
+    Steps
+    -----
+    1. Run a full ``run_custom_svm_analysis`` with ``test_size=0.50`` to get
+       the hold-out accuracy and identify the best kernel + params.
+    2. Run ``cross_val_score`` with that winning estimator using
+       ``StratifiedKFold(n_splits=n_cv_folds)`` on the full dataset.
+    3. Return both scores plus a combined grade.
+    """
+    if kernels is None:
+        kernels = ["linear", "rbf"]
+
+    # Step 1 — 50/50 holdout with GridSearchCV kernel selection
+    result_50 = run_custom_svm_analysis(
+        frame=frame,
+        target_column=target_column,
+        feature_columns=feature_columns,
+        kernels=kernels,
+        test_size=0.50,
+    )
+
+    # Step 2 — n-fold CV on the full dataset with the winning estimator
+    X, y = prepare_custom_classification_data(frame, target_column, feature_columns)
+    min_class = int(y.value_counts().min())
+    actual_folds = min(n_cv_folds, min_class)
+    if actual_folds < 2:
+        raise ValueError(
+            f"Dataset too small for {n_cv_folds}-fold CV: smallest class has only {min_class} row(s)."
+        )
+
+    cv = StratifiedKFold(n_splits=actual_folds, shuffle=True, random_state=RANDOM_STATE)
+    cv_scores = cross_val_score(
+        result_50.selected_estimator,
+        X,
+        y,
+        cv=cv,
+        scoring="accuracy",
+        n_jobs=-1,
+    )
+
+    cv_mean = float(cv_scores.mean())
+    cv_std = float(cv_scores.std())
+    grade = round((result_50.test_accuracy + cv_mean) / 2, 4)
+
+    return EvaluationResult(
+        target_column=target_column,
+        feature_columns=list(feature_columns),
+        holdout_accuracy=result_50.test_accuracy,
+        holdout_macro_f1=result_50.macro_f1,
+        cv_mean_accuracy=cv_mean,
+        cv_std_accuracy=cv_std,
+        grade=grade,
+        kernels_tested=list(kernels),
+        n_cv_folds=actual_folds,
+    )
+

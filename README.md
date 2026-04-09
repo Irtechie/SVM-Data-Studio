@@ -81,6 +81,31 @@ python main.py
 streamlit run streamlit_app.py
 ```
 
+## Possible Local LLM Models
+
+If this workspace needs a local-model reference for sidecar help, summaries, or future LLM-assisted controls, use LLMCommune as the source of truth instead of duplicating protocol assumptions here.
+
+Current preferred large entry:
+
+- display name: `Gemma 4 31B 256K`
+- `profile_id`: `gguf_gemma4_31b_large`
+- `model_id`: `google/gemma-4-31B-it`
+- runtime family: `llama.cpp`
+- lane: `large`
+- serving host: `spark-f147`
+- base URL: `http://192.168.1.203:8000`
+- multimodal: image input supported
+
+Selection rule:
+
+- read `GET /api/llm-host/current`
+- read `GET /api/llm-host/models`
+- if `large.profile_id == "gguf_gemma4_31b_large"`, treat `Gemma 4 31B 256K` as the active large model
+- trust `recommended_context_tokens` from the live JSON instead of assuming a context window
+- use the adapter metadata from the live JSON instead of hardcoding protocol details
+
+This keeps SVM aligned with the same live local-model truth Inferno uses, without turning this repo into a second model registry.
+
 The UI lets you:
 
 - upload your own CSV or start from a built-in demo dataset
