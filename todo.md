@@ -47,12 +47,9 @@ All completed work has been moved to `todo_done.md`.
 
 - (empty)
 
-## Completed this session (moved from Parked)
+## Blocked
 
-- [x] **review-01** — Benchmark leaderboard now shows Macro-F1 alongside accuracy for both LLM and control SVMs. Calibration check flags a large F1/accuracy gap as a likely majority-class collapse.
-- [x] **review-02** — Row-count warning shown when dataset exceeds 10k rows, explaining Streamlit rerender cost and O(n²) SVM scaling.
-- [x] **review-03** — LLM explain system prompt updated to restrict commentary to dataset-specific observations only. Core concept explanations are canned (app UI panels); LLM no longer re-explains what SVM or itemset mining is.
-- [x] **review-04** — "Why did this fail?" button appears on SVM Lab when accuracy < 75%. Calls `diagnose_bad_result_stream()` in `llm_advisor.py` which diagnoses the top 1-3 SVM failure modes and recommends concrete fixes.
+- [!] No active blockers.
 
 ## Blocked
 

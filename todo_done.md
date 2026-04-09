@@ -4,6 +4,26 @@ Historical completions moved out of `todo.md` so the live runner stays focused o
 
 ## Completed Tasks
 
+- [x] ~~Margin quality transparency: report F1 and calibration check alongside accuracy in benchmark leaderboard~~
+  - Task ID: review-01
+  - Completed: 2026-04-09
+  - Validation: Benchmark stat grid now shows Macro-F1 for both LLM and control SVMs. State panel fires a calibration warning when accuracy − F1 > 0.10 (likely majority-class collapse).
+
+- [x] ~~Row-count scalability warning: notify users when dataset exceeds 10k rows~~
+  - Task ID: review-02
+  - Completed: 2026-04-09
+  - Validation: Warning banner shown after `load_data_source()` when `len(frame) > 10_000`, explaining Streamlit rerender cost and O(n²) SVM scaling.
+
+- [x] ~~Guidance quality guardrails: canned core-concept explanations, LLM restricted to dataset-specific commentary~~
+  - Task ID: review-03
+  - Completed: 2026-04-09
+  - Validation: `_EXPLAIN_SYSTEM_PROMPT` rewritten to ban technique re-explanation; LLM told to focus only on the specific numbers and dataset domain in front of it.
+
+- [x] ~~"Why did this fail?" advisor mode: diagnose bad SVM runs with the LLM~~
+  - Task ID: review-04
+  - Completed: 2026-04-09
+  - Validation: `diagnose_bad_result_stream()` added to `llm_advisor.py`. "Why did this fail?" button appears on SVM Lab when test accuracy < 75%; streams a diagnosis of the top SVM failure modes with concrete fixes.
+
 - [x] ~~Adopt the shared todo rules and seed a single live runner for UI polish work~~
   - Task ID: ui-runner-01
   - Completed: 2026-03-29
