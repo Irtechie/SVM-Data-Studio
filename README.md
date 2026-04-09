@@ -5,13 +5,16 @@ This project is a hands-on SVM learning workspace that moves from intuition to i
 ## Screenshots
 
 ### SVM Visualizer — step-by-step decision boundary
-![SVM Visualizer showing raw data scatter, decision boundary, and margin with support vectors](docs/screenshots/svm_visualizer.png)
+![SVM Visualizer showing decision boundary and margin with support vectors](docs/screenshots/svm_visualizer.png)
+
+### Itemset Mining — top frequent patterns chart
+![Top Frequent Itemsets bar chart showing co-occurring attribute combinations by support](docs/screenshots/itemset_mining.png)
 
 ### Episode Mining — ordered pattern chart
 ![Episode mining bar chart showing top ordered sequences by support, e.g. frontpage → frontpage at 0.28](docs/screenshots/episode_mining.png)
 
 ### LLM Explain — live streaming output
-![LLM explanation streaming tokens in real time for Frequent Itemset Mining results](docs/screenshots/llm_explain_stream.png)
+![LLM explanation streaming tokens in real time for Episode Mining results](docs/screenshots/llm_explain_stream.png)
 
 ### LLM Explain — prompt debug expander
 ![Prompt sent to LLM expander showing the system message and structured user message](docs/screenshots/llm_prompt_debug.png)
