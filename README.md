@@ -2,6 +2,20 @@
 
 This project is a hands-on SVM learning workspace that moves from intuition to implementation and then broadens into itemset and episode mining. The goal is to help you understand SVMs like a professional practitioner, not just run a single classifier.
 
+## Screenshots
+
+### SVM Visualizer — step-by-step decision boundary
+![SVM Visualizer showing raw data scatter, decision boundary, and margin with support vectors](docs/screenshots/svm_visualizer.png)
+
+### Episode Mining — ordered pattern chart
+![Episode mining bar chart showing top ordered sequences by support, e.g. frontpage → frontpage at 0.28](docs/screenshots/episode_mining.png)
+
+### LLM Explain — live streaming output
+![LLM explanation streaming tokens in real time for Frequent Itemset Mining results](docs/screenshots/llm_explain_stream.png)
+
+### LLM Explain — prompt debug expander
+![Prompt sent to LLM expander showing the system message and structured user message](docs/screenshots/llm_prompt_debug.png)
+
 ## What is included
 
 - `simple` data: Iris with two petal features, ideal for seeing margins and decision boundaries.
