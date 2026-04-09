@@ -666,10 +666,66 @@ def plot_pattern_figure(frame: pd.DataFrame, label_column: str, title: str, pale
     return figure
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _probe_models(base_url: str) -> list[str]:
+    """Query the endpoint for available model IDs (cached 30 s)."""
+    from svm_studio.llm_advisor import fetch_available_models
+    return fetch_available_models(base_url)
+
+
+def _llm_url_and_model_widgets(
+    url_key: str,
+    model_key: str,
+    url_label: str = "LLM base URL",
+    default_url: str = "",
+    inside_form: bool = True,
+) -> tuple[str, str]:
+    """Render a URL text-input and auto-derive the model from the endpoint.
+
+    - 1 model available  → selected silently, shown as a read-only info chip
+    - Multiple models    → compact selectbox to pick one
+    - Unreachable / blank URL → small fallback text input
+
+    Returns *(base_url, model)*.
+    """
+    base_url = st.text_input(
+        url_label,
+        value=default_url,
+        placeholder="http://192.168.1.203:8000",
+        key=url_key,
+    )
+
+    model = ""
+    if base_url and base_url.startswith("http"):
+        models = _probe_models(base_url)
+        if len(models) == 1:
+            model = models[0]
+            st.caption(f"Model auto-detected: **{model}**")
+            # Store in session so downstream reads via session_state still work
+            st.session_state[model_key] = model
+        elif len(models) > 1:
+            stored = st.session_state.get(model_key, models[0])
+            default_idx = models.index(stored) if stored in models else 0
+            model = st.selectbox("Model", models, index=default_idx, key=model_key)
+        else:
+            # Unreachable — tiny fallback text input
+            model = st.text_input(
+                "Model name (endpoint unreachable — enter manually)",
+                value=st.session_state.get(model_key, os.environ.get("LLM_MODEL", "")),
+                placeholder="e.g. gemma-4-31B-it-Q4_K_M.gguf",
+                key=model_key,
+            )
+    else:
+        # No URL yet — hide the model field entirely, default from env
+        model = os.environ.get("LLM_MODEL", "")
+
+    return base_url, model
+
+
 def load_data_source() -> tuple[pd.DataFrame | None, str | None]:
     with st.sidebar:
         st.header("Data Source")
-        source_mode = st.radio("Choose input", ["Upload CSV", "Built-in demo"], index=0, key="source_mode")
+        source_mode = st.radio("Choose input", ["Built-in demo", "Upload CSV"], index=0, key="source_mode")
 
         if source_mode == "Upload CSV":
             uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
@@ -680,13 +736,57 @@ def load_data_source() -> tuple[pd.DataFrame | None, str | None]:
             return frame, uploaded_file.name
 
         demo_sources = load_demo_sources()
-        demo_options = [source.title for source in demo_sources]
-        st.session_state.setdefault("demo_name", demo_options[0])
-        if st.session_state["demo_name"] not in demo_options:
-            st.session_state["demo_name"] = demo_options[0]
-        demo_name = st.selectbox("Choose a demo dataset", demo_options, key="demo_name")
+
+        # Group for display: classification first, then SVM demos, then mining
+        _group_order = {"classification": 0, "svm": 1, "itemset": 2, "episode": 3}
+        demo_sources_sorted = sorted(demo_sources, key=lambda s: _group_order.get(s.group, 9))
+        demo_options = [source.title for source in demo_sources_sorted]
+
+        # Group labels for the selectbox
+        _group_labels = {
+            "classification": "── Classification datasets ──",
+            "svm": "── SVM boundary demos ──",
+            "itemset": "── Itemset mining ──",
+            "episode": "── Episode mining ──",
+        }
+        current_group = None
+        grouped_options = []
+        for src in demo_sources_sorted:
+            grp_label = _group_labels.get(src.group, f"── {src.group} ──")
+            if src.group != current_group:
+                grouped_options.append(grp_label)
+                current_group = src.group
+            grouped_options.append(src.title)
+
+        all_options = grouped_options
+        # Filter out group headers for the actual value
+        valid_titles = set(demo_options)
+
+        # Default index: first actual dataset (skip the leading group header)
+        _prev = st.session_state.get("demo_name")
+        if _prev and _prev in valid_titles:
+            _default_idx = all_options.index(_prev)
+        else:
+            _default_idx = next(i for i, o in enumerate(all_options) if o in valid_titles)
+
+        selected = st.selectbox(
+            "Choose a demo dataset",
+            all_options,
+            index=_default_idx,
+            key="demo_name_raw",
+            format_func=lambda x: x,
+        )
+        # If user picked a header label, use previous valid title or first valid
+        if selected not in valid_titles:
+            selected = st.session_state.get("demo_name") or demo_options[0]
+        else:
+            st.session_state["demo_name"] = selected
+
+        demo_name = selected
         selected_source = next(source for source in demo_sources if source.title == demo_name)
-        st.caption(f"{selected_source.group.upper()} DEMO: {selected_source.description}")
+        rows = getattr(selected_source, 'rows', None)
+        row_str = f" · {rows:,} rows" if rows else ""
+        st.caption(f"{selected_source.group.upper()}{row_str} — {selected_source.description}")
         return load_demo_frame(demo_name), demo_name
 
 
@@ -1082,7 +1182,56 @@ def render_svm_tab(frame: pd.DataFrame, source_name: str) -> None:
     )
     _llm_explain_button("svm_explain", "SVM Kernel Comparison", svm_summary, frame)
 
-    st.subheader("Geometry view")
+    # ── "Why did this fail?" diagnostic mode ──────────────────────────────
+    _POOR_ACCURACY_THRESHOLD = 0.75
+    if result.test_accuracy < _POOR_ACCURACY_THRESHOLD:
+        st.divider()
+        st.markdown(
+            f"**Accuracy {result.test_accuracy:.3f} is below {_POOR_ACCURACY_THRESHOLD:.0%} — "
+            "SVMs fail in characteristic ways. Ask the advisor to diagnose this run.**"
+        )
+        if st.button("Why did this fail? (LLM diagnosis)", key="svm_diagnose", width='stretch'):
+            from svm_studio.llm_advisor import diagnose_bad_result_stream, _build_data_context, fetch_available_models
+            base_url = (
+                st.session_state.get("advisor_base_url_input")
+                or st.session_state.get("chat_base_url")
+                or os.environ.get("LLM_BASE_URL")
+                or None
+            )
+            api_key = st.session_state.get("advisor_api_key_input") or st.session_state.get("chat_api_key") or None
+            model = st.session_state.get("advisor_model_input") or st.session_state.get("chat_model") or None
+            if not model and base_url:
+                models = fetch_available_models(base_url)
+                model = models[0] if models else None
+            ctx = _build_data_context(frame, max_cat_samples=3, sample_rows=0, include_correlations=False)[:600] if frame is not None else None
+            st.session_state.pop("svm_diagnosis", None)
+            st.session_state.pop("svm_diagnosis_error", None)
+            _think = st.empty()
+            _think.info("Diagnosing failure — waiting for first token…")
+            def _diag_stream():
+                try:
+                    yield from diagnose_bad_result_stream(svm_summary, ctx, api_key=api_key, model=model, base_url=base_url)
+                except Exception as _e:
+                    st.session_state["svm_diagnosis_error"] = str(_e)
+            try:
+                text = st.write_stream(_diag_stream())
+                _think.empty()
+                if text:
+                    st.session_state["svm_diagnosis"] = text
+                else:
+                    st.session_state["svm_diagnosis_error"] = st.session_state.pop("svm_diagnosis_error", "Model returned empty response.")
+            except Exception as exc:
+                _think.empty()
+                st.session_state["svm_diagnosis_error"] = f"{type(exc).__name__}: {exc}"
+
+        diag_err = st.session_state.get("svm_diagnosis_error")
+        if diag_err:
+            st.error("Diagnosis failed")
+            st.code(diag_err)
+        diag_text = st.session_state.get("svm_diagnosis")
+        if diag_text:
+            with st.expander("LLM Diagnosis", expanded=True):
+                st.markdown(diag_text)
     st.caption("Use this to translate the abstract hyperplane into something you can actually inspect on screen.")
     numeric_features = _numeric_visualization_columns(frame, result.feature_columns)
 
@@ -1220,16 +1369,11 @@ def render_advisor_tab(frame: pd.DataFrame, source_name: str) -> None:
             advisor_model: str | None = None
         elif backend == "Local / Remote LLM":
             api_key = ""
-            advisor_base_url = st.text_input(
-                "LLM base URL  (e.g. http://host:8000  — /v1 appended automatically if needed)",
-                value=os.environ.get("LLM_BASE_URL", ""),
-                placeholder="http://192.168.1.203:8000",
-                key="advisor_base_url_input",
-            )
-            advisor_model = st.text_input(
-                "Model name",
-                value=os.environ.get("LLM_MODEL", "gemma-4-31B-it-Q4_K_M.gguf"),
-                key="advisor_model_input",
+            advisor_base_url, advisor_model = _llm_url_and_model_widgets(
+                url_key="advisor_base_url_input",
+                model_key="advisor_model_input",
+                url_label="LLM base URL  (e.g. http://host:8000)",
+                default_url=os.environ.get("LLM_BASE_URL", ""),
             )
         else:  # Heuristic
             api_key = ""
@@ -1594,6 +1738,16 @@ def render_itemset_tab(frame: pd.DataFrame, source_name: str) -> None:
         f"Top 15 patterns:\n{top_patterns.to_string(index=False)}"
     )
     _llm_explain_button("itemset_explain", "Frequent Itemset Mining", itemset_summary, frame)
+
+
+def render_episode_tab(frame: pd.DataFrame, source_name: str) -> None:
+    # Reset column/separator/support selections when the dataset changes
+    if st.session_state.get("_episode_source") != source_name:
+        st.session_state.pop("sequence_column", None)
+        st.session_state.pop("sequence_separator", None)
+        st.session_state.pop("episode_support", None)
+        st.session_state["_episode_source"] = source_name
+
     ui_shell.render_section_intro(
         "Sequence Lab",
         "Mine ordered event behavior instead of static combinations",
@@ -1637,11 +1791,24 @@ def render_itemset_tab(frame: pd.DataFrame, source_name: str) -> None:
         mode = st.radio("Sequence source", ["Delimited sequence column", "Ordered event columns"], horizontal=True, key="episode_mode")
         max_length = st.slider("Maximum episode length", min_value=2, max_value=4, value=3, step=1, key="episode_length")
         max_span = st.slider("Maximum span", min_value=2, max_value=8, value=4, step=1, key="episode_span")
-        min_support = st.slider("Minimum support", min_value=0.05, max_value=0.90, value=0.30, step=0.01, key="episode_support")
+        min_support = st.slider("Minimum support", min_value=0.01, max_value=0.90, value=0.10, step=0.01, key="episode_support")
 
         if mode == "Delimited sequence column":
-            sequence_column = st.selectbox("Sequence column", frame.columns, key="sequence_column")
-            separator = st.text_input("Event separator", value=",", key="sequence_separator")
+            # Auto-detect a good sequence column: prefer columns whose name suggests sequences
+            # and whose values contain the separator character
+            _seq_candidates = [c for c in frame.columns if any(k in c.lower() for k in ("sequence", "journey", "path", "events", "seq"))]
+            _seq_default_idx = list(frame.columns).index(_seq_candidates[0]) if _seq_candidates else 0
+            sequence_column = st.selectbox("Sequence column", frame.columns, index=_seq_default_idx, key="sequence_column")
+            # Auto-detect separator: check whether values use ", " or "," or " "
+            _sep_default = ", "
+            _sample_vals = frame[sequence_column].dropna().astype(str).head(20)
+            if _sample_vals.str.contains(r", ", regex=True).any():
+                _sep_default = ", "
+            elif _sample_vals.str.contains(",", regex=False).any():
+                _sep_default = ","
+            elif _sample_vals.str.contains(" ", regex=False).any():
+                _sep_default = " "
+            separator = st.text_input("Event separator", value=_sep_default, key="sequence_separator")
             run_episodes = st.form_submit_button("Run episode mining", width='stretch')
         else:
             ordered_columns = st.multiselect("Ordered event columns", frame.columns, key="episode_columns")
@@ -1892,48 +2059,69 @@ def render_benchmark_tab() -> None:
     )
 
     # ── Dataset form ──────────────────────────────────────────────────────
+    # Source must be OUTSIDE the form so changing it reruns immediately
+    # and the dataset-name widget updates to match.
+    _SKLEARN_NAMES = ["iris", "wine", "breast_cancer", "digits", "20newsgroups",
+                      "olivetti_faces", "covtype", "kddcup99"]
+    _CSV_NAMES = [
+        "cancer_uci.csv", "fraud_openml.csv", "wine_uci.csv", "titanic_openml.csv",
+        "banknote_auth.csv", "diabetes_pima.csv", "credit_german.csv", "churn_telecom.csv",
+        "steel_plates.csv", "digits_sklearn.csv", "har_smartphone.csv",
+        "sensorless_drive.csv", "spambase.csv", "adult_census.csv",
+        "shuttle_nasa.csv", "fashion_mnist.csv",
+    ]
+    _OPENML_PRESETS = ["44 (Spambase)", "1590 (Adult Census)", "40685 (NASA Shuttle)",
+                       "40996 (Fashion MNIST)", "31 (German Credit)", "37 (Pima Diabetes)",
+                       "1478 (HAR Smartphone)", "1501 (Sensorless Drive)"]
+    _UCI_PRESETS = ["iris", "wine", "breast_cancer", "car", "adult", "mushroom"]
+    _HF_PRESETS = ["imdb", "ag_news", "emotion", "trec"]
+
+    src_col, _ = st.columns([1, 2])
+    with src_col:
+        source = st.selectbox(
+            "Source", ["sklearn", "openml", "ucimlrepo", "csv", "huggingface"],
+            key="bench_source",
+        )
+
     with st.form("benchmark_form"):
         st.subheader("Dataset")
-        ds_col1, ds_col2 = st.columns(2)
-        with ds_col1:
-            source = st.selectbox(
-                "Source", ["sklearn", "openml", "ucimlrepo", "huggingface", "csv"],
-                key="bench_source",
-            )
+        ds_col2, _ = st.columns([2, 1])
         with ds_col2:
             if source == "sklearn":
+                ds_name = st.selectbox("Dataset name", _SKLEARN_NAMES, key="bench_sklearn_name")
+            elif source == "csv":
                 ds_name = st.selectbox(
-                    "Dataset name",
-                    ["iris", "wine", "breast_cancer", "digits", "20newsgroups",
-                     "olivetti_faces", "covtype", "kddcup99"],
-                    key="bench_sklearn_name",
+                    "Dataset file",
+                    _CSV_NAMES,
+                    key="bench_csv_name",
+                    help="Files in data/external/",
                 )
-            else:
-                ds_name = st.text_input(
-                    "Dataset name / ID / path",
-                    placeholder="e.g. 40 (OpenML id), imdb (HuggingFace), /path/to/data.csv",
-                    key="bench_ds_name",
+            elif source == "openml":
+                ds_name = st.selectbox(
+                    "Dataset (id or name)",
+                    _OPENML_PRESETS,
+                    key="bench_openml_name",
+                    help="Select a preset or type an OpenML dataset id/name.",
+                )
+                ds_name = ds_name.split(" ")[0]  # extract just the id
+            elif source == "ucimlrepo":
+                ds_name = st.selectbox(
+                    "Dataset name", _UCI_PRESETS, key="bench_uci_name"
+                )
+            else:  # huggingface
+                ds_name = st.selectbox(
+                    "Dataset name", _HF_PRESETS, key="bench_hf_name"
                 )
 
         max_ex = st.slider("Max examples to label (reduces LLM cost)", 10, 500, 100, step=10, key="bench_max_ex")
 
         st.subheader("LLM Configuration")
-        llm_col1, llm_col2, llm_col3 = st.columns(3)
-        with llm_col1:
-            bench_base_url = st.text_input(
-                "LLM base URL",
-                value=os.environ.get("LLM_BASE_URL", ""),
-                placeholder="http://host:8000",
-                key="bench_base_url",
-            )
-        with llm_col2:
-            bench_model = st.text_input(
-                "Model name",
-                value=os.environ.get("LLM_MODEL", "gemma-4-31B-it-Q4_K_M.gguf"),
-                key="bench_model",
-            )
-        with llm_col3:
-            bench_api_key = st.text_input("API key (optional)", type="password", key="bench_api_key")
+        bench_base_url, bench_model = _llm_url_and_model_widgets(
+            url_key="bench_base_url",
+            model_key="bench_model",
+            default_url=os.environ.get("LLM_BASE_URL", ""),
+        )
+        bench_api_key = st.text_input("API key (optional)", type="password", key="bench_api_key")
 
         st.subheader("Optional Techniques")
         opt_col1, opt_col2, opt_col3, opt_col4 = st.columns(4)
@@ -1986,6 +2174,58 @@ def render_benchmark_tab() -> None:
             progress_bar.progress(min(frac, 1.0), text=f"{stage} …")
             status_text.caption(f"{stage}: {current}/{total}" if total else stage)
 
+        # ── Live labeling display ─────────────────────────────────────────
+        st.markdown("#### Live labeling")
+        live_left, live_right = st.columns([1, 2])
+        with live_left:
+            st.caption("Labels assigned so far")
+            label_grid = st.empty()
+        with live_right:
+            st.caption("LLM conversation")
+            convo_stream = st.empty()
+
+        convo_log: list[tuple[int, str, str, str, float]] = []
+        label_log: list[tuple[int, str, float]] = []   # (idx, label, confidence)
+
+        LABEL_COLOURS = [
+            "#18c5d8", "#ff7a18", "#7ef2c8", "#ffd166",
+            "#e05c97", "#6a7fff", "#63c132", "#e8733a",
+        ]
+        label_colour_map: dict[str, str] = {}
+
+        def _conversation(idx: int, prompt: str, response: str, label: str, confidence: float) -> None:
+            convo_log.append((idx, prompt, response, label, confidence))
+            label_log.append((idx, label, confidence))
+
+            # assign a stable colour per unique label
+            if label not in label_colour_map:
+                label_colour_map[label] = LABEL_COLOURS[len(label_colour_map) % len(LABEL_COLOURS)]
+
+            # ── left: label chips grid ────────────────────────────────────
+            chips_html = "<div style='display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;'>"
+            for _i, _lbl, _conf in label_log:
+                col = label_colour_map.get(_lbl, "#aaa")
+                chips_html += (
+                    f"<span title='#{_i}: {_lbl} ({_conf:.0%})' style='"
+                    f"background:{col};color:#091722;font-size:0.72rem;"
+                    f"font-weight:600;padding:3px 7px;border-radius:999px;"
+                    f"cursor:default;'>{_lbl}</span>"
+                )
+            chips_html += "</div>"
+            label_grid.markdown(chips_html, unsafe_allow_html=True)
+
+            # ── right: last 4 prompt/response pairs ───────────────────────
+            stream_md = ""
+            for _idx, _prompt, _resp, _label, _conf in convo_log[-4:]:
+                ok = _label != "unknown"
+                icon = "✅" if ok else "❓"
+                stream_md += (
+                    f"**{icon} #{_idx} → `{_label}`** ({_conf:.0%} confidence)\n\n"
+                    f"> **Prompt (excerpt):** {_prompt[200:400].strip()}…\n\n"
+                    f"> **Response:** {_resp[:300].strip()}\n\n---\n\n"
+                )
+            convo_stream.markdown(stream_md)
+
         try:
             result: ExperimentResult = run_experiment(
                 source=source,
@@ -1997,6 +2237,7 @@ def render_benchmark_tab() -> None:
                 max_examples=max_ex,
                 save_to_db=True,
                 progress_callback=_progress,
+                conversation_callback=_conversation,
             )
             st.session_state["bench_result"] = result
             st.session_state.pop("bench_error", None)
@@ -2021,20 +2262,34 @@ def render_benchmark_tab() -> None:
 
     er = result.eval_result
 
+    # ── Quality note: what these numbers mean ─────────────────────────────
+    st.info(
+        "**What 'quality' means here:** Agreement and SVM accuracy are proxies. "
+        "A strategy can score well on accuracy and still generalise poorly — especially with small or imbalanced datasets. "
+        "Use F1 (below) alongside accuracy. Calibration check: if LLM SVM F1 is much lower than its accuracy, "
+        "the model is likely predicting the majority class and the labels are not usable."
+    )
+
     # ── Key metrics ───────────────────────────────────────────────────────
     ui_shell.render_stat_grid([
         ("LLM Agreement", f"{er.llm_agreement_rate:.1%}", "Fraction of LLM labels matching ground truth."),
         ("LLM SVM Accuracy", f"{er.llm_metrics.test_accuracy:.3f}", "SVM trained on LLM labels, scored vs true labels."),
+        ("LLM SVM Macro-F1", f"{er.llm_metrics.test_macro_f1:.3f}", "F1 across all classes — more robust than accuracy for imbalanced datasets."),
         ("Control SVM Accuracy", f"{er.control_metrics.test_accuracy:.3f}", "SVM trained on true labels."),
+        ("Control SVM Macro-F1", f"{er.control_metrics.test_macro_f1:.3f}", "Control F1 — compare with LLM F1 to measure labeling quality."),
         ("Labeling Cost", f"{er.labeling_cost:+.3f}", "Control − LLM accuracy. Positive = LLM loses performance."),
     ])
 
     sign = "better" if er.labeling_cost <= 0 else "worse"
+    # Calibration check: if F1 << accuracy, majority-class collapse is likely
+    _f1_gap = er.llm_metrics.test_accuracy - er.llm_metrics.test_macro_f1
+    _calib_note = f" ⚠ F1 gap {_f1_gap:.2f} — possible majority-class collapse." if _f1_gap > 0.10 else ""
     ui_shell.render_state_panel(
         "success" if er.labeling_cost <= 0.05 else "warning",
-        f"LLM labels performed {sign} than expected",
-        f"Agreement: {er.llm_agreement_rate:.1%} | LLM SVM: {er.llm_metrics.test_accuracy:.3f} | "
-        f"Control: {er.control_metrics.test_accuracy:.3f} | Cost: {er.labeling_cost:+.3f}",
+        f"LLM labels performed {sign} than ground truth",
+        f"Agreement: {er.llm_agreement_rate:.1%} | LLM Acc: {er.llm_metrics.test_accuracy:.3f} "
+        f"F1: {er.llm_metrics.test_macro_f1:.3f} | Control Acc: {er.control_metrics.test_accuracy:.3f} "
+        f"F1: {er.control_metrics.test_macro_f1:.3f} | Cost: {er.labeling_cost:+.3f}{_calib_note}",
         detail=f"Most common error: {er.most_common_error} | Worst class: {er.worst_class} | Best class: {er.best_class}",
     )
 
@@ -2624,24 +2879,79 @@ def _llm_explain_button(
     result_summary: str,
     frame: pd.DataFrame | None,
 ) -> None:
-    """Render an 'Explain with LLM' button that calls ``explain_result``."""
+    """Render an 'Explain with LLM' button that streams the reply token-by-token."""
     if st.button("Explain with LLM", key=key, width='stretch'):
-        from svm_studio.llm_advisor import explain_result, _build_data_context
+        from svm_studio.llm_advisor import (
+            explain_result_stream, _build_data_context,
+            fetch_available_models, build_explain_messages,
+        )
 
-        base_url = st.session_state.get("chat_base_url") or st.session_state.get("advisor_base_url_input") or None
+        base_url = (
+            st.session_state.get("advisor_base_url_input")
+            or st.session_state.get("chat_base_url")
+            or os.environ.get("LLM_BASE_URL")
+            or None
+        )
         api_key = st.session_state.get("chat_api_key") or st.session_state.get("advisor_api_key_input") or None
-        model = st.session_state.get("chat_model") or st.session_state.get("advisor_model_input") or None
+        model = st.session_state.get("advisor_model_input") or st.session_state.get("chat_model") or None
 
-        ctx = _build_data_context(frame, sample_rows=5) if frame is not None else None
-        with st.spinner("Asking LLM to explain the result …"):
+        if not model and base_url:
+            models = fetch_available_models(base_url)
+            model = models[0] if models else None
+
+        # Minimal context: shape + column names only, no sample rows or correlations
+        if frame is not None:
+            ctx_full = _build_data_context(
+                frame, max_cat_samples=3, sample_rows=0, include_correlations=False
+            )
+            ctx = ctx_full[:600] + ("\n[...truncated...]" if len(ctx_full) > 600 else "")
+        else:
+            ctx = None
+
+        # Show the prompt being sent
+        msgs = build_explain_messages(technique, result_summary, ctx)
+        total_chars = sum(len(m["content"]) for m in msgs)
+        with st.expander(f"Prompt sent to LLM  ({total_chars:,} chars)", expanded=False):
+            for m in msgs:
+                st.markdown(f"**`{m['role']}`**")
+                st.code(m["content"], language=None, wrap_lines=True)
+
+        # Safe streaming wrapper — surfaces generator exceptions to the caller
+        def _safe_stream():
             try:
-                explanation = explain_result(
+                yield from explain_result_stream(
                     technique, result_summary, ctx,
                     api_key=api_key, model=model, base_url=base_url,
                 )
-                st.session_state[f"{key}_explanation"] = explanation
-            except Exception as exc:
-                st.error(f"LLM explanation failed: {exc}")
+            except Exception as _gen_exc:
+                st.session_state[f"{key}_stream_error"] = str(_gen_exc)
+
+        # Clear any previous error before a new attempt
+        st.session_state.pop(f"{key}_error", None)
+        st.session_state.pop(f"{key}_explanation", None)
+
+        # Thinking indicator
+        _think = st.empty()
+        _think.info("Querying LLM — waiting for first token…")
+        try:
+            full_text = st.write_stream(_safe_stream())
+            _think.empty()
+            stream_err = st.session_state.pop(f"{key}_stream_error", None)
+            if stream_err:
+                st.session_state[f"{key}_error"] = stream_err
+            elif full_text:
+                st.session_state[f"{key}_explanation"] = full_text
+            else:
+                st.session_state[f"{key}_error"] = "Model returned an empty response."
+        except Exception as exc:
+            _think.empty()
+            st.session_state[f"{key}_error"] = f"{type(exc).__name__}: {exc}"
+
+    # Always render persisted error or explanation (survives reruns)
+    error_msg = st.session_state.get(f"{key}_error")
+    if error_msg:
+        st.error(f"LLM explanation failed")
+        st.code(error_msg)
 
     explanation = st.session_state.get(f"{key}_explanation")
     if explanation:
@@ -2909,16 +3219,11 @@ def render_chat_tab(frame: pd.DataFrame | None, source_name: str | None) -> None
             st.session_state["chat_base_url"] = ""
             st.session_state.setdefault("chat_model", "gpt-4o-mini")
         elif chat_backend == "Local / Remote LLM":
-            st.text_input(
-                "LLM base URL",
-                value=st.session_state.get("advisor_base_url_input") or os.environ.get("LLM_BASE_URL", ""),
-                placeholder="http://192.168.1.203:8000",
-                key="chat_base_url",
-            )
-            st.text_input(
-                "Model name",
-                value=st.session_state.get("advisor_model_input") or os.environ.get("LLM_MODEL", "gemma-4-31B-it-Q4_K_M.gguf"),
-                key="chat_model",
+            _llm_url_and_model_widgets(
+                url_key="chat_base_url",
+                model_key="chat_model",
+                default_url=st.session_state.get("advisor_base_url_input") or os.environ.get("LLM_BASE_URL", ""),
+                inside_form=False,
             )
         if st.button("Clear chat history", use_container_width=False):
             st.session_state["chat_messages"] = []
@@ -3045,16 +3350,10 @@ def render_batch_tab() -> None:
             b_model: str | None = None
         elif b_backend == "Local / Remote LLM":
             b_api_key = ""
-            b_base_url = st.text_input(
-                "LLM base URL",
-                value=st.session_state.get("advisor_base_url_input") or os.environ.get("LLM_BASE_URL", ""),
-                placeholder="http://192.168.1.203:8000",
-                key="batch_base_url",
-            )
-            b_model = st.text_input(
-                "Model name",
-                value=st.session_state.get("advisor_model_input") or os.environ.get("LLM_MODEL", "gemma-4-31B-it-Q4_K_M.gguf"),
-                key="batch_model",
+            b_base_url, b_model = _llm_url_and_model_widgets(
+                url_key="batch_base_url",
+                model_key="batch_model",
+                default_url=st.session_state.get("advisor_base_url_input") or os.environ.get("LLM_BASE_URL", ""),
             )
         else:
             b_api_key, b_base_url, b_model = "", None, None
@@ -3182,7 +3481,7 @@ def render_batch_tab() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="SVM Data Studio", layout="wide")
+    st.set_page_config(page_title="SVM Data Studio", layout="wide", initial_sidebar_state="expanded")
     apply_style()
     ui_shell.inject_app_css()
 
@@ -3192,7 +3491,16 @@ def main() -> None:
 
     frame, source_name = load_data_source()
 
-    # ── Session save / restore ─────────────────────────────────────────────
+    # ── Row-count scalability warning ──────────────────────────────────────
+    if frame is not None and len(frame) > 10_000:
+        st.warning(
+            f"**Large dataset detected: {len(frame):,} rows.** "
+            "Streamlit rerenders the full page on every interaction. "
+            "Interactive replotting may be slow past ~10k rows. "
+            "SVM training with an RBF kernel also scales as O(n²) in memory — "
+            "consider sampling before running the full benchmark.",
+            icon="⚠️",
+        )
     with st.sidebar:
         st.divider()
         with st.expander("Session settings", expanded=False):
@@ -3291,7 +3599,7 @@ def main() -> None:
         render_itemset_tab(frame, source_name)
 
     def episode_page() -> None:
-        render_itemset_tab(frame, source_name)
+        render_episode_tab(frame, source_name)
 
     def advisor_page() -> None:
         render_advisor_tab(frame, source_name)

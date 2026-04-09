@@ -77,6 +77,7 @@ def run_experiment(
     save_to_db: bool = True,
     db_path: Path | None = None,
     progress_callback: Any = None,
+    conversation_callback: Any = None,
     dataset_loader_kwargs: dict[str, Any] | None = None,
 ) -> ExperimentResult:
     """Run a full benchmark experiment.
@@ -127,7 +128,12 @@ def run_experiment(
     def _label_progress(current: int, total: int) -> None:
         _progress("LLM labeling", current, total)
 
-    labeled = labeler.label(dataset, max_examples=max_examples, progress_callback=_label_progress)
+    labeled = labeler.label(
+        dataset,
+        max_examples=max_examples,
+        progress_callback=_label_progress,
+        conversation_callback=conversation_callback,
+    )
     _progress("LLM labeling", n, n)
 
     # ── 3. SVM evaluation ─────────────────────────────────────────────────

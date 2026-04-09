@@ -97,19 +97,22 @@ class LLMLabeler:
         dataset: StandardDataset,
         max_examples: int | None = None,
         progress_callback: Any = None,
+        conversation_callback: Any = None,
     ) -> LabeledDataset:
         """Label all (or up to *max_examples*) examples in *dataset*.
 
         Parameters
         ----------
         progress_callback : callable(current, total) or None
-            Called after each batch so callers can update a progress bar.
+            Called after each example so callers can update a progress bar.
+        conversation_callback : callable(idx, prompt, response, label, confidence) or None
+            Called after each LLM call so callers can display the live conversation.
         """
         n = len(dataset.X) if max_examples is None else min(max_examples, len(dataset.X))
         records: list[LabelRecord] = []
 
         for i in range(n):
-            rec = self._label_one(i, dataset)
+            rec = self._label_one(i, dataset, conversation_callback=conversation_callback)
             records.append(rec)
             if (i + 1) % self.batch_size == 0:
                 logger.info("Labeled %d / %d examples", i + 1, n)
@@ -191,11 +194,11 @@ class LLMLabeler:
 
     # ── internal helpers ───────────────────────────────────────────────────
 
-    def _label_one(self, idx: int, dataset: StandardDataset) -> LabelRecord:
+    def _label_one(self, idx: int, dataset: StandardDataset, conversation_callback: Any = None) -> LabelRecord:
         row = dataset.X.iloc[idx]
         true_label = str(dataset.y.iloc[idx])
         prompt = _build_prompt(row, dataset)
-        return self._call_llm(idx, prompt, dataset.class_names, true_label)
+        return self._call_llm(idx, prompt, dataset.class_names, true_label, conversation_callback=conversation_callback)
 
     def _call_llm(
         self,
@@ -203,6 +206,7 @@ class LLMLabeler:
         prompt: str,
         class_names: list[str],
         true_label: str,
+        conversation_callback: Any = None,
     ) -> LabelRecord:
         messages = [{"role": "user", "content": prompt}]
         label = _FALLBACK_LABEL
@@ -224,6 +228,11 @@ class LLMLabeler:
                 parsed = _parse_label_response(raw, class_names)
                 if parsed is not None:
                     label, confidence, reasoning = parsed
+                    if conversation_callback is not None:
+                        try:
+                            conversation_callback(idx, prompt, raw, label, confidence)
+                        except Exception:
+                            pass
                     break
             except Exception as exc:
                 latency_ms = (time.perf_counter() - t0) * 1000

@@ -54,27 +54,45 @@ html, body, [class*="css"] {
     visibility: hidden;
 }
 
-/* Hide the default Streamlit decoration bar but keep nav accessible */
+/* ── Header — hide decoration, keep nav ─────────────────────────── */
 header[data-testid="stHeader"] {
     background: transparent !important;
-    border-bottom: none !important;
     box-shadow: none !important;
 }
 
+/* Hide Deploy button */
+header [data-testid="stToolbar"] {
+    display: none !important;
+}
+
+/* ── Sidebar collapse / expand toggle — always visible ─────────── */
+[data-testid="stSidebarCollapseButton"],
+[data-testid="stSidebarCollapseButton"] button,
+[data-testid="collapsedControl"],
+[data-testid="collapsedControl"] button {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    background: var(--accent) !important;
+    color: #091722 !important;
+    border-radius: 50% !important;
+    width: 2rem !important;
+    height: 2rem !important;
+    align-items: center !important;
+    justify-content: center !important;
+    box-shadow: 0 4px 12px rgba(24, 197, 216, 0.4) !important;
+}
+
+[data-testid="stSidebarCollapseButton"] button svg,
+[data-testid="collapsedControl"] button svg {
+    fill: #091722 !important;
+    color: #091722 !important;
+}
+
+/* ── Sidebar — light, clean, matches theme ──────────────────────── */
 [data-testid="stSidebar"] {
-    background:
-        radial-gradient(circle at 100% 0%, rgba(24, 197, 216, 0.18), transparent 22%),
-        linear-gradient(180deg, rgba(7, 16, 27, 0.98) 0%, rgba(10, 25, 39, 0.97) 100%);
-    border-right: 1px solid rgba(126, 242, 200, 0.12);
-}
-
-[data-testid="stSidebar"] * {
-    color: #f8f4ec !important;
-}
-
-[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
-[data-testid="stSidebar"] label p {
-    color: #f8f4ec !important;
+    background: var(--bg-metal) !important;
+    border-right: 1px solid var(--line-strong) !important;
 }
 
 a,
@@ -345,7 +363,21 @@ button[kind="primaryFormSubmit"]:hover {
     font-size: clamp(2.4rem, 4.3vw, 4.9rem);
     line-height: 0.92;
     letter-spacing: -0.04em;
-    color: #f7fbff;
+    /* Microsoft four-square colour split across the word */
+    background: linear-gradient(
+        90deg,
+        #f25022 0%,   /* MS red */
+        #f25022 24%,
+        #ffb900 24%,  /* MS yellow */
+        #ffb900 48%,
+        #7fba00 48%,  /* MS green */
+        #7fba00 72%,
+        #00a4ef 72%,  /* MS blue */
+        #00a4ef 100%
+    );
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
 }
 
 .hero-copy {

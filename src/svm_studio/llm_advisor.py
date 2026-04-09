@@ -277,6 +277,27 @@ def _get(url: str, timeout: float = 3.0) -> dict | None:
     return None
 
 
+def fetch_available_models(base_url: str) -> list[str]:
+    """Query *base_url* and return the list of model IDs available.
+
+    Works with llama.cpp, vLLM, LM Studio, TRT-LLM (OpenAI-compat /v1/models)
+    and Ollama native (/api/tags).  Returns an empty list if unreachable.
+    """
+    stripped = base_url.rstrip("/")
+    # OpenAI-compat: /v1/models → {"data": [{"id": "..."}, ...]}
+    candidates = [stripped] if stripped.endswith("/v1") else [stripped + "/v1", stripped]
+    for candidate in candidates:
+        data = _get(candidate + "/models")
+        if isinstance(data, dict) and "data" in data:
+            return [m.get("id", "") for m in data["data"] if m.get("id")]
+    # Ollama native: /api/tags → {"models": [{"name": "..."}, ...]}
+    host_root = stripped.removesuffix("/v1")
+    data = _get(host_root + "/api/tags")
+    if isinstance(data, dict) and "models" in data:
+        return [m.get("name", "") for m in data["models"] if m.get("name")]
+    return []
+
+
 def _detect_backend(base_url: str) -> tuple[str, str]:
     """Probe *base_url* and return *(style, resolved_url)*.
 
@@ -313,6 +334,7 @@ def _call_openai_compat(
     api_key: str,
     model: str,
     messages: list[dict],
+    max_tokens: int = 512,
 ) -> str:
     if not _OPENAI_AVAILABLE:
         raise RuntimeError("The 'openai' package is not installed.  Run: pip install openai")
@@ -324,9 +346,99 @@ def _call_openai_compat(
         model=model,
         messages=messages,
         temperature=0.2,
-        max_tokens=512,
+        max_tokens=max_tokens,
     )
     return (response.choices[0].message.content or "").strip()
+
+
+def stream_openai_compat(
+    base_url: str | None,
+    api_key: str,
+    model: str,
+    messages: list[dict],
+    max_tokens: int = 600,
+    include_reasoning: bool = False,
+):
+    """Streaming variant — yields text chunks as they arrive.
+
+    For thinking models (e.g. Gemma 4) the model emits tokens in
+    ``delta.reasoning_content`` before writing ``delta.content``.  Set
+    ``include_reasoning=True`` to stream those tokens to the caller so the
+    user sees something while the model is thinking.
+    """
+    if not _OPENAI_AVAILABLE:
+        raise RuntimeError("The 'openai' package is not installed.")
+    kwargs: dict = {"api_key": api_key or "none"}
+    if base_url:
+        kwargs["base_url"] = base_url
+    client = _OpenAI(**kwargs)
+    with client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=max_tokens,
+        stream=True,
+    ) as stream:
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            # Thinking-model reasoning tokens
+            reasoning = getattr(delta, "reasoning_content", None)
+            if include_reasoning and reasoning:
+                yield reasoning
+            # Final answer tokens
+            content = getattr(delta, "content", None)
+            if content:
+                yield content
+
+
+def build_explain_messages(
+    technique: str,
+    result_summary: str,
+    dataset_context: str | None = None,
+) -> list[dict]:
+    """Build the messages list for an explain call without sending it."""
+    # Cap result_summary to avoid exceeding model context window
+    trimmed_summary = result_summary[:1500] + ("\n[...truncated...]" if len(result_summary) > 1500 else "")
+    user_parts = [f"## Technique: {technique}", "", trimmed_summary]
+    if dataset_context:
+        trimmed_ctx = dataset_context[:600] + ("\n[...truncated...]" if len(dataset_context) > 600 else "")
+        user_parts.extend(["", "## Dataset context", trimmed_ctx])
+    return [
+        {"role": "system", "content": _EXPLAIN_SYSTEM_PROMPT},
+        {"role": "user", "content": "\n".join(user_parts)},
+    ]
+
+
+def explain_result_stream(
+    technique: str,
+    result_summary: str,
+    dataset_context: str | None = None,
+    *,
+    api_key: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+):
+    """Streaming version of explain_result — yields text chunks."""
+    resolved_url = base_url or os.environ.get("LLM_BASE_URL", "") or None
+    resolved_key = api_key or os.environ.get("OPENAI_API_KEY", "") or None
+    resolved_model = model or ("gemma-4-31B-it-Q4_K_M.gguf" if resolved_url else "gpt-4o-mini")
+
+    messages = build_explain_messages(technique, result_summary, dataset_context)
+
+    if resolved_url:
+        style, resolved = _detect_backend(resolved_url)
+        if style != "ollama":
+            yield from stream_openai_compat(
+                resolved, resolved_key or "ollama", resolved_model, messages,
+                max_tokens=2000, include_reasoning=True,
+            )
+            return
+
+    # Fallback: non-streaming call for ollama / no URL
+    result = chat_completion(messages, api_key=api_key, model=model, base_url=base_url, max_tokens=2000)
+    yield result
 
 
 def _call_ollama_native(base_url: str, model: str, messages: list[dict]) -> str:
@@ -490,28 +602,33 @@ When suggesting a dataset:
 _EXPLAIN_SYSTEM_PROMPT = """\
 You are an expert data-science educator embedded in an SVM workbench.
 The user just ran a machine-learning technique and got structured results.
-Your job is to explain those results in **plain English** so a non-expert can
-understand what happened and why.
+The workbench already shows canned explanations of what each technique does and
+what its core metrics mean — core concepts are already covered.
+
+Your job is ONLY to provide **dataset-specific commentary** on the actual numbers
+in front of you.  Do NOT re-explain what SVM, itemset mining, or episode mining is.
+Focus entirely on what these numbers tell us about this particular dataset.
 
 ## Structure of your answer
-1. **What happened** — one-paragraph summary of the technique that was run.
-2. **Key findings** — walk through the most important numbers and say what they
+1. **Key findings** — walk through the most important numbers and say what they
    mean in the context of this specific dataset (cite column names, class labels,
-   and metric values).
-3. **Why it makes sense** — give a grounded explanation using the dataset's domain.
-   For example: "It makes sense that *glucose* and *BMI* are the strongest
-   discriminators for diabetes because …".
-4. **Surprises & counter-examples** — highlight anything that *contradicts*
-   common intuition or popular assumptions.  Frame it like: "You might expect X,
-   but the data shows Y instead — here is why that could happen."
-5. **Practical take-away** — one or two sentences on what the user should do next
-   or how to use this result.
+   and metric values directly).
+2. **Why it makes sense for this data** — give a grounded, domain-specific
+   explanation.  For example: "It makes sense that *glucose* and *BMI* are the
+   strongest discriminators here because patients with diabetes typically have …".
+3. **Surprises & counter-examples** — highlight anything that *contradicts*
+   common intuition for this domain.  Frame it as: "You might expect X given this
+   dataset, but the data shows Y instead — a possible reason is …".
+4. **Practical next step** — one or two sentences on what to try next given
+   these specific results.
 
 ## Rules
 - Ground every claim in the numbers provided.  Do not invent metrics.
-- Keep the total length between 200 and 600 words.
+- Do NOT explain what the technique is — assume the user already knows.
+- Keep the total length between 150 and 500 words.
 - Use Markdown formatting: bold key terms, bullet lists for findings.
-- If the results are inconclusive or bad, say so honestly.
+- If the results are inconclusive or bad, say so honestly and suggest a fix.
+- Label your response clearly as AI-generated commentary on this specific run.
 """
 
 
@@ -537,15 +654,118 @@ def explain_result(
     """
     user_parts = [f"## Technique: {technique}", "", result_summary]
     if dataset_context:
-        user_parts.extend(["", "## Dataset context", dataset_context])
+        # Trim context so the total prompt stays manageable for local models
+        trimmed_ctx = dataset_context[:2000] + ("\n[...truncated...]" if len(dataset_context) > 2000 else "")
+        user_parts.extend(["", "## Dataset context", trimmed_ctx])
 
     messages: list[dict] = [
         {"role": "system", "content": _EXPLAIN_SYSTEM_PROMPT},
         {"role": "user", "content": "\n".join(user_parts)},
     ]
     return chat_completion(
-        messages, api_key=api_key, model=model, base_url=base_url,
+        messages, api_key=api_key, model=model, base_url=base_url, max_tokens=600,
     )
+
+
+_DIAGNOSE_SYSTEM_PROMPT = """\
+You are a senior machine-learning engineer debugging a poor SVM result.
+SVMs fail in characteristic ways. Your job is to diagnose which failure mode(s)
+are most likely given the metrics and dataset description provided, and to
+recommend concrete fixes in priority order.
+
+## Common SVM failure modes
+1. **Unscaled features** — one feature has a much larger range than others,
+   distorting the margin. Fix: StandardScaler before SVC.
+2. **Wrong kernel for the geometry** — data is non-linearly separable but
+   a linear kernel was used (or vice versa). Fix: try RBF or poly.
+3. **C too high** — model overfits the training set, accuracy drops on hold-out.
+   Fix: reduce C (e.g. 0.1–1.0).
+4. **C too low** — model is under-regularised, boundary is too smooth. Fix: increase C.
+5. **Class imbalance** — majority class dominates; model predicts it always.
+   Fix: class_weight='balanced', check F1 not just accuracy.
+6. **Too few training examples** — SVM starved of signal. Fix: collect more data
+   or use a simpler kernel with stronger regularisation.
+7. **Irrelevant features** — noisy columns dilute the margin. Fix: feature selection.
+8. **gamma too high (RBF)** — model memorises training points, very local boundary.
+   Fix: reduce gamma or use 'scale'.
+
+## Your response format
+- Start with **Likely failure mode(s):** and list the top 1-3 suspects with
+  a one-sentence explanation grounded in the numbers.
+- Then **Recommended fixes:** in numbered priority order with specific parameter
+  suggestions where possible.
+- Keep the total response under 300 words.
+- Do NOT re-explain what SVM is. Get straight to the diagnosis.
+"""
+
+
+def diagnose_bad_result(
+    result_summary: str,
+    dataset_context: str | None = None,
+    *,
+    api_key: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+) -> str:
+    """Ask the LLM to diagnose why an SVM run produced poor results.
+
+    Parameters
+    ----------
+    result_summary : str
+        Structured text with the key metrics (accuracy, F1, kernel, C, etc.).
+    dataset_context : str, optional
+        Brief dataset description (shape, column types).
+    """
+    user_parts = ["## SVM run summary", "", result_summary]
+    if dataset_context:
+        trimmed_ctx = dataset_context[:600] + ("\n[...truncated...]" if len(dataset_context) > 600 else "")
+        user_parts.extend(["", "## Dataset context", trimmed_ctx])
+    user_parts.extend(["", "Please diagnose why this run performed poorly and recommend fixes."])
+
+    messages: list[dict] = [
+        {"role": "system", "content": _DIAGNOSE_SYSTEM_PROMPT},
+        {"role": "user", "content": "\n".join(user_parts)},
+    ]
+    return chat_completion(
+        messages, api_key=api_key, model=model, base_url=base_url, max_tokens=600,
+    )
+
+
+def diagnose_bad_result_stream(
+    result_summary: str,
+    dataset_context: str | None = None,
+    *,
+    api_key: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+):
+    """Streaming version of diagnose_bad_result — yields text chunks."""
+    resolved_url = base_url or os.environ.get("LLM_BASE_URL", "") or None
+    resolved_key = api_key or os.environ.get("OPENAI_API_KEY", "") or None
+    resolved_model = model or ("gemma-4-31B-it-Q4_K_M.gguf" if resolved_url else "gpt-4o-mini")
+
+    user_parts = ["## SVM run summary", "", result_summary]
+    if dataset_context:
+        trimmed_ctx = dataset_context[:600] + ("\n[...truncated...]" if len(dataset_context) > 600 else "")
+        user_parts.extend(["", "## Dataset context", trimmed_ctx])
+    user_parts.extend(["", "Please diagnose why this run performed poorly and recommend fixes."])
+
+    messages: list[dict] = [
+        {"role": "system", "content": _DIAGNOSE_SYSTEM_PROMPT},
+        {"role": "user", "content": "\n".join(user_parts)},
+    ]
+
+    if resolved_url:
+        style, resolved = _detect_backend(resolved_url)
+        if style != "ollama":
+            yield from stream_openai_compat(
+                resolved, resolved_key or "ollama", resolved_model, messages,
+                max_tokens=600, include_reasoning=True,
+            )
+            return
+
+    result = chat_completion(messages, api_key=api_key, model=model, base_url=base_url, max_tokens=600)
+    yield result
 
 
 def chat_completion(
@@ -554,6 +774,7 @@ def chat_completion(
     api_key: str | None = None,
     model: str | None = None,
     base_url: str | None = None,
+    max_tokens: int = 512,
 ) -> str:
     """Send a multi-turn chat message list to the configured LLM and return the reply.
 
@@ -568,7 +789,7 @@ def chat_completion(
         style, resolved = _detect_backend(resolved_url)
         if style == "ollama":
             return _call_ollama_native(resolved, resolved_model, messages)
-        return _call_openai_compat(resolved, resolved_key or "ollama", resolved_model, messages)
+        return _call_openai_compat(resolved, resolved_key or "ollama", resolved_model, messages, max_tokens=max_tokens)
 
     if resolved_key:
         return _call_openai_compat(None, resolved_key, resolved_model, messages)
