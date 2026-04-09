@@ -13,3 +13,4 @@ openai>=1.0,<3.0
 # mlxtend>=0.23,<1.0        # Itemset mining — Apriori/FP-Growth (pip install mlxtend)
 # prefixspan>=0.5,<1.0      # Episode mining fallback (pip install prefixspan)
 fpdf2>=2.7,<3.0             # PDF report export (pip install fpdf2)
+
